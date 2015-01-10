@@ -8,20 +8,21 @@
 
 #include "util.h"
 
-#define CONNECT_TIMEOUT 5
+#define CONNECT_TIMEOUT 1
+#define SEND_TIMEOUT    5
 
-#define NUM_STATE   3
+#define NUM_STATE   4
 #define NUM_EVENT   8
 
 enum pakcet_type { F_CON = 0, F_FIN = 1, F_ACK = 2, F_DATA = 3 };   // Packet Type
-enum proto_state { wait_CON = 0, CON_sent = 1, CONNECTED = 2 };     // States
+enum proto_state { wait_CON = 0, CON_sent = 1, CONNECTED = 2, SENDING = 3 };     // States
 
 // Events
 enum proto_event { RCV_CON = 0, RCV_FIN = 1, RCV_ACK = 2, RCV_DATA = 3,
                    CONNECT = 4, CLOSE = 5,   SEND = 6,    TIMEOUT = 7 };
 
 char *pkt_name[] = { "F_CON", "F_FIN", "F_ACK", "F_DATA" };
-char *st_name[] =  { "wait_CON", "CON_sent", "CONNECTED" };
+char *st_name[] =  { "wait_CON", "CON_sent", "CONNECTED", "SENDING" };
 char *ev_name[] =  { "RCV_CON", "RCV_FIN", "RCV_ACK", "RCV_DATA",
                      "CONNECT", "CLOSE",   "SEND",    "TIMEOUT"   };
 
@@ -34,6 +35,8 @@ struct state_action {           // Protocol FSM Structure
 struct packet {                 // 504 Byte Packet to & from Simulator
     unsigned short type;        // enum packet_type
     unsigned short size;
+    unsigned int seq_number;
+    unsigned int ack_number;
     char data[MAX_DATA_SIZE];
 };
 
@@ -79,8 +82,20 @@ void send_packet(int flag, void *p, int size)
     
     pkt.type = flag;
     pkt.size = size;
-    if (size)
+
+    if (size) {
         memcpy(pkt.data, ((struct p_event *)p)->packet.data, (size > MAX_DATA_SIZE) ? MAX_DATA_SIZE : size);
+        pkt.seq_number = ((struct p_event *)p)->packet.seq_number;
+    }
+
+    if (flag == F_ACK && p != NULL) {
+        pkt.ack_number = ((struct p_event *)p)->packet.seq_number + 1;
+    }
+
+    if (flag == F_CON && p != NULL) {
+        pkt.seq_number = ((struct p_event *)p)->packet.seq_number;
+    }
+
     Send((char *)&pkt, sizeof(struct packet) - MAX_DATA_SIZE + size);
 }
 
@@ -92,13 +107,13 @@ static void report_connect(void *p)
 
 static void passive_con(void *p)
 {
-    send_packet(F_ACK, NULL, 0);
+    send_packet(F_ACK, (struct p_event *)p, 0);
     report_connect(NULL);
 }
 
 static void active_con(void *p)
 {
-    send_packet(F_CON, NULL, 0);
+    send_packet(F_CON, (struct p_event *)p, 0);
     set_timer(CONNECT_TIMEOUT);
 }
 
@@ -110,15 +125,30 @@ static void close_con(void *p)
 
 static void send_data(void *p)
 {
-    printf("Send Data to peer '%s' size:%d\n",
-        ((struct p_event*)p)->packet.data, ((struct p_event*)p)->size);
+    printf("Send Data to peer '%s' size:%d seq_number:%d\n",
+        ((struct p_event*)p)->packet.data, ((struct p_event*)p)->size, ((struct p_event *)p)->packet.seq_number);
     send_packet(F_DATA, (struct p_event *)p, ((struct p_event *)p)->size);
+
+    set_timer(SEND_TIMEOUT);
 }
 
-static void report_data(void *p)
+static void receive_data(void *p)
 {
-    printf("Data Arrived data='%s' size:%d\n",
-        ((struct p_event*)p)->packet.data, ((struct p_event*)p)->packet.size);
+    printf("Data Arrived: data='%s' size:%d seq_number:%d\n",
+        ((struct p_event*)p)->packet.data, ((struct p_event*)p)->packet.size, ((struct p_event*)p)->packet.seq_number);
+
+    // make error in ACK
+    ((struct p_event *)p)->packet.seq_number-=rand()%2;
+
+    send_packet(F_ACK, (struct p_event *)p, 0);
+}
+
+static void receive_ack(void *p)
+{
+    printf("ACK Received: ack_number=%d\n",
+        ((struct p_event*)p)->packet.ack_number);
+
+    set_timer(0);           // Stop Timer
 }
 
 struct state_action p_FSM[NUM_STATE][NUM_EVENT] = {
@@ -135,16 +165,20 @@ struct state_action p_FSM[NUM_STATE][NUM_EVENT] = {
    { NULL,        CON_sent },  { close_con, wait_CON }, { NULL,           CON_sent },  { close_con, wait_CON }},
 
   // - CONNECTED state
-  {{ NULL, CONNECTED },        { close_con, wait_CON }, { NULL,      CONNECTED },      { report_data, CONNECTED },
-   { NULL, CONNECTED },        { close_con, wait_CON }, { send_data, CONNECTED },      { NULL,        CONNECTED }},
+  {{ NULL, CONNECTED },        { close_con, wait_CON }, { NULL,      CONNECTED },      { receive_data, CONNECTED },
+   { NULL, CONNECTED },        { close_con, wait_CON }, { send_data, SENDING   },      { NULL,         CONNECTED }},
+
+  // - SENDING state
+  {{ NULL, CONNECTED },        { close_con, wait_CON }, { receive_ack, CONNECTED },      { receive_data, CONNECTED },
+   { NULL, CONNECTED },        { close_con, wait_CON }, { NULL,        CONNECTED },      { send_data,    SENDING  }},
 };
 
-int data_count = 0;
+int data_count = 1;
 
 struct p_event *get_event(void)
 {
     static struct p_event event;    // not thread-safe
-    
+
 loop:
     // Check if there is user command
     if (!kbhit()) {
@@ -152,17 +186,30 @@ loop:
         if(timedout) {
             timedout = 0;
             event.event = TIMEOUT;
+            event.packet.seq_number = data_count - 1;
+            sprintf(event.packet.data, "%09d", data_count - 1);
+            event.size = strlen(event.packet.data) + 1;
         } else {
             // Check Packet arrival by event_wait()
             ssize_t n = Recv((char*)&event.packet, sizeof(struct packet));
             if (n > 0) {
                 // if then, decode header to make event
                 switch (event.packet.type) {
-                    case F_CON:  event.event = RCV_CON;  break;
-                    case F_ACK:  event.event = RCV_ACK;  break;
-                    case F_FIN:  event.event = RCV_FIN;  break;
+                    case F_CON:
+                        event.event = RCV_CON;
+                        break;
+                    case F_ACK:
+                        if(event.packet.ack_number != data_count) {
+                            printf("ACK Ignored: expected=%d, but received=%d\n", data_count, event.packet.ack_number);
+                            goto loop;
+                        }
+                        event.event = RCV_ACK;
+                        break;
+                    case F_FIN:
+                        event.event = RCV_FIN;
+                        break;
                     case F_DATA:
-                        event.event = RCV_DATA; break;
+                        event.event = RCV_DATA;
                         event.size = event.packet.size;
                         break;
                     default:
@@ -174,10 +221,23 @@ loop:
     } else {
         int n = getchar();
         switch (n) {
-            case '0': event.event = CONNECT; break;
-            case '1': event.event = CLOSE;   break;
+            case '0': 
+                event.event = CONNECT;
+                event.packet.seq_number = data_count++;
+                break;
+            case '1':
+                event.event = CLOSE;
+                break;
             case '2':
+                /*
+                printf("Keyboard pushed, Event: %d\n", event.event);
+                if(event.event == SENDING) {
+                    printf("Keyboard locked");
+                    goto loop;
+                }
+                */
                 event.event = SEND;
+                event.packet.seq_number = data_count;
                 sprintf(event.packet.data, "%09d", data_count++);
                 event.size = strlen(event.packet.data) + 1;
                 break;
