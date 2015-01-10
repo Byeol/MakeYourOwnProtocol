@@ -3,13 +3,14 @@
 // FSM sample code
 //
 // Created by Minsuk Lee, 2014.11.1.
-// Copyright (c) 2014. Minsuk Lee All rights reserved.
+// Edited by Jaewon Seo, 2015.1.10.
+// Copyright (c) 2014. Minsuk Lee & Jaewon Seo All rights reserved.
 // see LICENSE
 
 #include "util.h"
 
 #define CONNECT_TIMEOUT 1
-#define SEND_TIMEOUT    5
+#define SEND_TIMEOUT    1
 
 #define NUM_STATE   4
 #define NUM_EVENT   8
@@ -88,16 +89,19 @@ void send_packet(int flag, void *p, int size)
         pkt.seq_number = ((struct p_event *)p)->packet.seq_number;
     }
 
-    if (flag == F_ACK && p != NULL) {
-        pkt.ack_number = ((struct p_event *)p)->packet.seq_number + 1;
+    if (flag == F_ACK) {
+        pkt.ack_number = ((struct p_event *)p)->packet.seq_number + ((struct p_event *)p)->packet.size;
     }
 
-    if (flag == F_CON && p != NULL) {
+    if (flag == F_CON) {
         pkt.seq_number = ((struct p_event *)p)->packet.seq_number;
     }
 
     Send((char *)&pkt, sizeof(struct packet) - MAX_DATA_SIZE + size);
 }
+
+int initial_seq_number;
+int received_size;
 
 static void report_connect(void *p)
 {
@@ -107,6 +111,8 @@ static void report_connect(void *p)
 
 static void passive_con(void *p)
 {
+    initial_seq_number = ((struct p_event *)p)->packet.seq_number;
+
     send_packet(F_ACK, (struct p_event *)p, 0);
     report_connect(NULL);
 }
@@ -132,20 +138,35 @@ static void send_data(void *p)
     set_timer(SEND_TIMEOUT);
 }
 
+static void save_data(void *p)
+{
+    printf("Data %d-%d saved: data='%s'\n",
+        ((struct p_event*)p)->packet.seq_number - initial_seq_number,
+        ((struct p_event*)p)->packet.seq_number - initial_seq_number + ((struct p_event*)p)->packet.size - 1,
+        ((struct p_event*)p)->packet.data);
+}
+
 static void receive_data(void *p)
 {
-    printf("Data Arrived: data='%s' size:%d seq_number:%d\n",
-        ((struct p_event*)p)->packet.data, ((struct p_event*)p)->packet.size, ((struct p_event*)p)->packet.seq_number);
+    printf("Data arrived: size=%d seq_number=%d\n",
+        ((struct p_event*)p)->packet.size, ((struct p_event*)p)->packet.seq_number);
+
+    if ((initial_seq_number + received_size) == ((struct p_event*)p)->packet.seq_number) {
+        save_data((struct p_event *)p);
+        received_size += ((struct p_event*)p)->packet.size;
+    } else {
+        printf("Data ignored\n");
+    }
 
     // make error in ACK
-    ((struct p_event *)p)->packet.seq_number-=rand()%2;
+    // ((struct p_event *)p)->packet.seq_number-=rand()%2;
 
     send_packet(F_ACK, (struct p_event *)p, 0);
 }
 
 static void receive_ack(void *p)
 {
-    printf("ACK Received: ack_number=%d\n",
+    printf("ACK received: ack_number=%d\n",
         ((struct p_event*)p)->packet.ack_number);
 
     set_timer(0);           // Stop Timer
@@ -170,10 +191,12 @@ struct state_action p_FSM[NUM_STATE][NUM_EVENT] = {
 
   // - SENDING state
   {{ NULL, CONNECTED },        { close_con, wait_CON }, { receive_ack, CONNECTED },      { receive_data, CONNECTED },
-   { NULL, CONNECTED },        { close_con, wait_CON }, { NULL,        CONNECTED },      { send_data,    SENDING  }},
+   { NULL, CONNECTED },        { close_con, wait_CON }, { NULL,        SENDING   },      { send_data,    SENDING  }},
 };
 
-int data_count = 1;
+int data_count;
+int current_seq_number;
+int next_seq_number;
 
 struct p_event *get_event(void)
 {
@@ -184,11 +207,14 @@ loop:
     if (!kbhit()) {
         // Check if timer is timed-out
         if(timedout) {
+            if(event.event == SEND) {
+                event.packet.seq_number = current_seq_number;
+                sprintf(event.packet.data, "%09d", data_count);
+                event.size = strlen(event.packet.data) + 1;
+                next_seq_number = current_seq_number + event.size;
+            }
             timedout = 0;
             event.event = TIMEOUT;
-            event.packet.seq_number = data_count - 1;
-            sprintf(event.packet.data, "%09d", data_count - 1);
-            event.size = strlen(event.packet.data) + 1;
         } else {
             // Check Packet arrival by event_wait()
             ssize_t n = Recv((char*)&event.packet, sizeof(struct packet));
@@ -199,11 +225,13 @@ loop:
                         event.event = RCV_CON;
                         break;
                     case F_ACK:
-                        if(event.packet.ack_number != data_count) {
-                            printf("ACK Ignored: expected=%d, but received=%d\n", data_count, event.packet.ack_number);
+                        if(event.packet.ack_number != next_seq_number) {
+                            printf("ACK ignored: expected=%d, but received=%d\n", next_seq_number, event.packet.ack_number);
                             goto loop;
                         }
                         event.event = RCV_ACK;
+                        data_count++;
+                        current_seq_number = next_seq_number;
                         break;
                     case F_FIN:
                         event.event = RCV_FIN;
@@ -223,23 +251,17 @@ loop:
         switch (n) {
             case '0': 
                 event.event = CONNECT;
-                event.packet.seq_number = data_count++;
+                event.packet.seq_number = current_seq_number;
                 break;
             case '1':
                 event.event = CLOSE;
                 break;
             case '2':
-                /*
-                printf("Keyboard pushed, Event: %d\n", event.event);
-                if(event.event == SENDING) {
-                    printf("Keyboard locked");
-                    goto loop;
-                }
-                */
                 event.event = SEND;
-                event.packet.seq_number = data_count;
-                sprintf(event.packet.data, "%09d", data_count++);
+                event.packet.seq_number = current_seq_number;
+                sprintf(event.packet.data, "%09d", data_count);
                 event.size = strlen(event.packet.data) + 1;
+                next_seq_number = current_seq_number + event.size;
                 break;
             case '3': return NULL;  // QUIT
             default:
@@ -253,6 +275,12 @@ void
 Protocol_Loop(void)
 {
     struct p_event *eventp;
+
+    data_count = 0;
+    received_size = 0;
+
+    srand(time(NULL));
+    current_seq_number = next_seq_number = rand(); // initial sequence number
 
     timer_init();
     while (1) {
