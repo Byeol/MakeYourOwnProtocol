@@ -87,18 +87,24 @@ int data_count;
 int current_seq_number;
 int next_seq_number;
 
+struct packet packet_to_send;
+
 void send_packet(int flags, void *p, int size)
 {
     struct packet pkt;
 
-    printf("SEND PACKET (FLAGS:");
-    if (flags & F_ACK)
-        printf(" F_ACK");
-    if (flags & F_SYN)
-        printf(" F_SYN");
-    if (flags & F_FIN)
-        printf(" F_FIN");
-    printf(")\n");
+    printf("SEND PACKET");
+
+    if (flags) {
+        printf(" :");
+        if (flags & F_ACK)
+            printf(" F_ACK");
+        if (flags & F_SYN)
+            printf(" F_SYN");
+        if (flags & F_FIN)
+            printf(" F_FIN");
+    }
+    printf("\n");
 
     pkt.flags = flags;
     pkt.size = size;
@@ -145,6 +151,16 @@ static void close_con(void *p)
 
 static void send_data(void *p)
 {
+    if (((struct p_event*)p)->event == SEND) {
+        memcpy(packet_to_send.data, ((struct p_event*)p)->packet.data, ((struct p_event*)p)->size);
+        packet_to_send.seq_number = ((struct p_event *)p)->packet.seq_number;
+    } else {
+        memcpy(((struct p_event*)p)->packet.data, packet_to_send.data, ((struct p_event*)p)->size);
+        ((struct p_event *)p)->packet.seq_number = packet_to_send.seq_number;
+    }
+
+    ((struct p_event*)p)->size = strlen(((struct p_event*)p)->packet.data) + 1;
+
     printf("Send Data to peer '%s' size:%d seq_number:%d\n",
         ((struct p_event*)p)->packet.data, ((struct p_event*)p)->size, ((struct p_event *)p)->packet.seq_number);
     send_packet(F_DATA, (struct p_event *)p, ((struct p_event *)p)->size);
@@ -154,10 +170,10 @@ static void send_data(void *p)
 
 static void save_data(void *p)
 {
-    printf("Data %d-%d saved: data='%s'\n",
+    printf("Data %d-%d saved: data='%s', received_size=%d\n",
         ((struct p_event*)p)->packet.seq_number - initial_seq_number,
         ((struct p_event*)p)->packet.seq_number - initial_seq_number + ((struct p_event*)p)->packet.size - 1,
-        ((struct p_event*)p)->packet.data);
+        ((struct p_event*)p)->packet.data, received_size);
 }
 
 static void receive_data(void *p)
@@ -165,7 +181,6 @@ static void receive_data(void *p)
     printf("Data arrived: size=%d seq_number=%d\n",
         ((struct p_event*)p)->packet.size, ((struct p_event*)p)->packet.seq_number);
 
-    printf("initial_seq_number: %d, received_size: %d\n", initial_seq_number, received_size);
     if ((initial_seq_number + received_size) == ((struct p_event*)p)->packet.seq_number) {
         save_data((struct p_event *)p);
         received_size += ((struct p_event*)p)->packet.size;
@@ -174,7 +189,7 @@ static void receive_data(void *p)
     }
 
     // make error in ACK
-    // ((struct p_event *)p)->packet.seq_number-=rand()%2;
+    ((struct p_event *)p)->packet.seq_number-=rand()%2;
 
     send_packet(F_ACK, (struct p_event *)p, 0);
 }
@@ -218,12 +233,6 @@ loop:
     if (!kbhit()) {
         // Check if timer is timed-out
         if(timedout) {
-            if(event.event == SEND) {
-                event.packet.seq_number = current_seq_number;
-                sprintf(event.packet.data, "%09d", data_count);
-                event.size = strlen(event.packet.data) + 1;
-                next_seq_number = current_seq_number + event.size;
-            }
             timedout = 0;
             event.event = TIMEOUT;
         } else {
@@ -234,7 +243,7 @@ loop:
                 switch (event.packet.flags) {
                     case F_SYN:
                         event.event = RCV_CON;
-                        printf("F_SYN: initial_seq_number setted: %d\n", event.packet.seq_number);
+                        printf("F_SYN: initial_seq_number set: %d\n", event.packet.seq_number);
                         initial_seq_number = event.packet.seq_number;
                         break;
                     case F_SYN | F_ACK:
@@ -244,7 +253,7 @@ loop:
                         }
                         event.event = RCV_ACK;
                         current_seq_number = next_seq_number;
-                        printf("F_SYN | F_ACK: initial_seq_number setted: %d\n", event.packet.seq_number);
+                        printf("F_SYN | F_ACK: initial_seq_number set: %d\n", event.packet.seq_number);
                         initial_seq_number = event.packet.seq_number;
                         break;
                     case F_ACK:
