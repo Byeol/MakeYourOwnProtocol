@@ -9,12 +9,12 @@
 
 #include "util.h"
 
-#define CONNECT_TIMEOUT 5
+#define CONNECT_TIMEOUT 3
 #define SEND_TIMEOUT    5
 
 #define SEND_BUFFER_SIZE 1
 
-#define NUM_STATE   4
+#define NUM_STATE   5
 #define NUM_EVENT   8
 
 #define F_DATA 0x0
@@ -22,14 +22,15 @@
 #define F_SYN 0x2
 #define F_FIN 0x4
 
-enum proto_state { wait_CON = 0, CON_sent = 1, CONNECTED = 2, SENDING = 3 };     // States
+// States
+enum proto_state { LISTEN = 0, SYN_SENT = 1, SYN_RECEIVED = 2, ESTABLISHED = 3, SENDING = 4};
 
 // Events
-enum proto_event { RCV_CON = 0, RCV_FIN = 1, RCV_ACK = 2, RCV_DATA = 3,
+enum proto_event { RCV_SYN = 0, RCV_FIN = 1, RCV_ACK = 2, RCV_DATA = 3,
                    CONNECT = 4, CLOSE = 5,   SEND = 6,    TIMEOUT = 7 };
 
-char *st_name[] =  { "wait_CON", "CON_sent", "CONNECTED", "SENDING" };
-char *ev_name[] =  { "RCV_CON", "RCV_FIN", "RCV_ACK", "RCV_DATA",
+char *st_name[] =  { "LISTEN", "SYN-SENT", "SYN-RECEIVED", "ESTABLISHED", "SENDING" };
+char *ev_name[] =  { "RCV_SYN", "RCV_FIN", "RCV_ACK", "RCV_DATA",
                      "CONNECT", "CLOSE",   "SEND",    "TIMEOUT"   };
 
 struct state_action {           // Protocol FSM Structure
@@ -52,7 +53,7 @@ struct p_event {                // Event Structure
     int size;               // event data size
 };
 
-enum proto_state c_state = wait_CON;         // Initial State
+enum proto_state c_state = LISTEN;         // Initial State
 volatile int timedout = 0;
 
 static void timer_handler(int signum)
@@ -112,7 +113,6 @@ void send_packet(int flags, void *p, int size)
         memcpy(pkt.data, ((struct p_event *)p)->packet.data, (size > MAX_DATA_SIZE) ? MAX_DATA_SIZE : size);
         pkt.seq_number = ((struct p_event *)p)->packet.seq_number;
         pkt.size = (size > MAX_DATA_SIZE) ? MAX_DATA_SIZE : size;
-        next_seq_number = pkt.seq_number + pkt.size;
     }
 
     if (flags & F_ACK) {
@@ -121,6 +121,11 @@ void send_packet(int flags, void *p, int size)
 
     if (flags & F_SYN) {
         pkt.seq_number = current_seq_number;
+        pkt.size = 1;
+    }
+
+    if (pkt.size) {
+    	next_seq_number = pkt.seq_number + pkt.size;
     }
 
     Send((char *)&pkt, sizeof(struct packet) - MAX_DATA_SIZE + size);
@@ -129,19 +134,25 @@ void send_packet(int flags, void *p, int size)
 static void report_connect(void *p)
 {
     set_timer(0);           // Stop Timer
-    printf("Connected\n");
-}
-
-static void passive_con(void *p)
-{
-    send_packet((F_SYN | F_ACK), (struct p_event *)p, 0);
-    report_connect(NULL);
+    printf("Connection established\n");
 }
 
 static void active_con(void *p)
 {
     send_packet(F_SYN, NULL, 0);
     set_timer(CONNECT_TIMEOUT);
+}
+
+static void passive_con(void *p)
+{
+    send_packet((F_SYN | F_ACK), (struct p_event *)p, 0);
+    set_timer(CONNECT_TIMEOUT);
+}
+
+static void receive_synack(void *p)
+{
+    send_packet(F_ACK, (struct p_event *)p, 0);
+    report_connect(NULL);
 }
 
 static void close_con(void *p)
@@ -172,8 +183,8 @@ static void send_data(void *p)
 static void save_data(void *p)
 {
     printf("Data %d-%d saved: data='%s', received_size=%d\n",
-        ((struct p_event*)p)->packet.seq_number - initial_seq_number,
-        ((struct p_event*)p)->packet.seq_number - initial_seq_number + ((struct p_event*)p)->packet.size - 1,
+        ((struct p_event*)p)->packet.seq_number - (initial_seq_number + 1),
+        ((struct p_event*)p)->packet.seq_number - (initial_seq_number + 1) + ((struct p_event*)p)->packet.size - 1,
         ((struct p_event*)p)->packet.data, received_size);
 }
 
@@ -182,7 +193,7 @@ static void receive_data(void *p)
     printf("Data arrived: size=%d seq_number=%d\n",
         ((struct p_event*)p)->packet.size, ((struct p_event*)p)->packet.seq_number);
 
-    if ((initial_seq_number + received_size) == ((struct p_event*)p)->packet.seq_number) {
+    if (((initial_seq_number + 1) + received_size) == ((struct p_event*)p)->packet.seq_number) {
         save_data((struct p_event *)p);
         received_size += ((struct p_event*)p)->packet.size;
     } else {
@@ -205,24 +216,29 @@ static void receive_ack(void *p)
 
 struct state_action p_FSM[NUM_STATE][NUM_EVENT] = {
   //  for each event:
-  //  RCV_CON,                 RCV_FIN,                 RCV_ACK,                       RCV_DATA,
-  //  CONNECT,                 CLOSE,                   SEND,                          TIMEOUT
+  //  RCV_SYN,						RCV_FIN,				RCV_ACK,							RCV_DATA,
+  //  CONNECT,						CLOSE,					SEND,								TIMEOUT
 
-  // - wait_CON state
-  {{ passive_con, CONNECTED }, { NULL, wait_CON },      { NULL, wait_CON },            { NULL, wait_CON },
-   { active_con,  CON_sent },  { NULL, wait_CON },      { NULL, wait_CON },            { NULL, wait_CON }},
 
-  // - CON_sent state
-  {{ passive_con, CONNECTED }, { close_con, wait_CON }, { report_connect, CONNECTED }, { NULL,      CON_sent },
-   { NULL,        CON_sent },  { close_con, wait_CON }, { NULL,           CON_sent },  { close_con, wait_CON }},
+  // - LISTEN state
+    {{ passive_con,	SYN_RECEIVED },	{ NULL,	LISTEN },		{ NULL,	LISTEN },					{ NULL,	LISTEN },
+     { active_con,	SYN_SENT	 },	{ NULL,	LISTEN },		{ NULL,	LISTEN },					{ NULL,	LISTEN }},
 
-  // - CONNECTED state
-  {{ NULL, CONNECTED },        { close_con, wait_CON }, { NULL,      CONNECTED },      { receive_data, CONNECTED },
-   { NULL, CONNECTED },        { close_con, wait_CON }, { send_data, SENDING   },      { NULL,         CONNECTED }},
+  // - SYN-SENT state
+    {{ NULL, SYN_SENT },			{ close_con, LISTEN },	{ receive_synack,	ESTABLISHED	},	{ NULL,		 SYN_SENT },
+     { NULL, SYN_SENT },			{ close_con, LISTEN },	{ NULL,				SYN_SENT	},	{ close_con, LISTEN	  }},
+
+  // - SYN-RECEIVED state
+    {{ NULL, SYN_RECEIVED },		{ close_con, LISTEN },	{ report_connect, 	ESTABLISHED	 },	{ NULL,		 SYN_RECEIVED },
+     { NULL, SYN_RECEIVED },		{ close_con, LISTEN },	{ NULL, 			SYN_RECEIVED },	{ close_con, LISTEN		  }},
+
+  // - ESTABLISHED state
+    {{ NULL, ESTABLISHED },			{ close_con, LISTEN },	{ NULL,				ESTABLISHED	},	{ receive_data, ESTABLISHED },
+     { NULL, ESTABLISHED },			{ close_con, LISTEN },	{ send_data,		SENDING		},	{ NULL,			ESTABLISHED }},
 
   // - SENDING state
-  {{ NULL, CONNECTED },        { close_con, wait_CON }, { receive_ack, CONNECTED },      { receive_data, CONNECTED },
-   { NULL, CONNECTED },        { close_con, wait_CON }, { NULL,        SENDING   },      { send_data,    SENDING  }},
+    {{ NULL, ESTABLISHED },			{ close_con, LISTEN },	{ receive_ack,		ESTABLISHED	},	{ receive_data, ESTABLISHED },
+     { NULL, ESTABLISHED },			{ close_con, LISTEN },	{ send_data,		SENDING		},	{ send_data,	SENDING }},
 };
 
 struct p_event *get_event(void)
@@ -257,7 +273,7 @@ loop:
 
                 switch (event.packet.flags) {
                     case F_SYN:
-                        event.event = RCV_CON;
+                        event.event = RCV_SYN;
                         break;
                     case F_ACK:
                         data_count++;
