@@ -8,13 +8,12 @@
 // see LICENSE
 
 #include "util.h"
+#include "queue.h"
 
 #define CONNECT_TIMEOUT 3
-#define SEND_TIMEOUT    5
+#define SEND_TIMEOUT    3
 
-#define SEND_BUFFER_SIZE 1
-
-#define NUM_STATE   5
+#define NUM_STATE   4
 #define NUM_EVENT   8
 
 #define F_DATA 0x0
@@ -22,14 +21,17 @@
 #define F_SYN 0x2
 #define F_FIN 0x4
 
+#define SEND_WINDOW_SIZE	5
+#define RECEIVE_WINDOW_SIZE	5
+
 // States
-enum proto_state { LISTEN = 0, SYN_SENT = 1, SYN_RECEIVED = 2, ESTABLISHED = 3, SENDING = 4};
+enum proto_state { LISTEN = 0, SYN_SENT = 1, SYN_RECEIVED = 2, ESTABLISHED = 3};
 
 // Events
 enum proto_event { RCV_SYN = 0, RCV_FIN = 1, RCV_ACK = 2, RCV_DATA = 3,
                    CONNECT = 4, CLOSE = 5,   SEND = 6,    TIMEOUT = 7 };
 
-char *st_name[] =  { "LISTEN", "SYN-SENT", "SYN-RECEIVED", "ESTABLISHED", "SENDING" };
+char *st_name[] =  { "LISTEN", "SYN-SENT", "SYN-RECEIVED", "ESTABLISHED" };
 char *ev_name[] =  { "RCV_SYN", "RCV_FIN", "RCV_ACK", "RCV_DATA",
                      "CONNECT", "CLOSE",   "SEND",    "TIMEOUT"   };
 
@@ -83,14 +85,19 @@ void set_timer(int sec)
     setitimer (ITIMER_REAL, &timer, NULL);
 }
 
-int initial_seq_number;
-int received_size;
-
 int data_count;
-int current_seq_number;
-int next_seq_number;
 
-struct packet send_buffer[SEND_BUFFER_SIZE];
+int my_initial_seq_number;
+int peer_initial_seq_number;
+
+QUEUE_T send_buffer;
+
+int last_acknowledgment_received;
+int last_frame_sent;
+
+int get_packet_size(char * data) {
+    return strlen(data) + 1;
+}
 
 void send_packet(int flags, void *p, int size)
 {
@@ -120,12 +127,9 @@ void send_packet(int flags, void *p, int size)
     }
 
     if (flags & F_SYN) {
-        pkt.seq_number = current_seq_number;
+        pkt.seq_number = my_initial_seq_number;
         pkt.size = 1;
-    }
-
-    if (pkt.size) {
-    	next_seq_number = pkt.seq_number + pkt.size;
+        last_frame_sent = pkt.seq_number + pkt.size;
     }
 
     Send((char *)&pkt, sizeof(struct packet) - MAX_DATA_SIZE + size);
@@ -135,6 +139,8 @@ static void report_connect(void *p)
 {
     set_timer(0);           // Stop Timer
     printf("Connection established\n");
+
+    last_acknowledgment_received = ((struct p_event*)p)->packet.ack_number;
 }
 
 static void active_con(void *p)
@@ -152,7 +158,7 @@ static void passive_con(void *p)
 static void receive_synack(void *p)
 {
     send_packet(F_ACK, (struct p_event *)p, 0);
-    report_connect(NULL);
+    report_connect((struct p_event *)p);
 }
 
 static void close_con(void *p)
@@ -163,18 +169,34 @@ static void close_con(void *p)
 
 static void send_data(void *p)
 {
-    if (((struct p_event*)p)->event == SEND) {
-        memcpy(send_buffer[0].data, ((struct p_event*)p)->packet.data, ((struct p_event*)p)->size);
-        send_buffer[0].seq_number = ((struct p_event *)p)->packet.seq_number;
-    } else {
-        memcpy(((struct p_event*)p)->packet.data, send_buffer[0].data, ((struct p_event*)p)->size);
-        ((struct p_event *)p)->packet.seq_number = send_buffer[0].seq_number;
-    }
-
-    ((struct p_event*)p)->size = strlen(((struct p_event*)p)->packet.data) + 1;
-
     printf("Send data to peer: data='%s' size=%d seq_number=%d\n",
         ((struct p_event*)p)->packet.data, ((struct p_event*)p)->size, ((struct p_event *)p)->packet.seq_number);
+    send_packet(F_DATA, (struct p_event *)p, ((struct p_event *)p)->size);
+
+    queue_push(&send_buffer, ((struct p_event *)p)->packet.data, ((struct p_event *)p)->size);
+    last_frame_sent = ((struct p_event *)p)->packet.seq_number + ((struct p_event *)p)->size - 1;
+
+    // printf("queue_size: %d\n", queue_size(&send_buffer));
+
+    set_timer(SEND_TIMEOUT);
+}
+
+static void resend_data(void *p)
+{
+    if (last_acknowledgment_received == last_frame_sent) {
+        set_timer(0);           // Stop Timer
+        // go to established state
+        return;
+    }
+
+    ((struct p_event *)p)->packet.seq_number = last_acknowledgment_received + 1;
+
+    char * data = queue_front(&send_buffer);
+    memcpy(((struct p_event *)p)->packet.data, data, strlen(data) + 1);
+    ((struct p_event*)p)->size = get_packet_size(((struct p_event *)p)->packet.data);
+
+    printf("Resend last data to peer: data='%s' size=%d seq_number=%d last_acknowledgment_received=%d\n",
+        ((struct p_event*)p)->packet.data, ((struct p_event*)p)->size, ((struct p_event *)p)->packet.seq_number, last_acknowledgment_received);
     send_packet(F_DATA, (struct p_event *)p, ((struct p_event *)p)->size);
 
     set_timer(SEND_TIMEOUT);
@@ -182,26 +204,21 @@ static void send_data(void *p)
 
 static void save_data(void *p)
 {
-    printf("Data %d-%d saved: data='%s', received_size=%d\n",
-        ((struct p_event*)p)->packet.seq_number - (initial_seq_number + 1),
-        ((struct p_event*)p)->packet.seq_number - (initial_seq_number + 1) + ((struct p_event*)p)->packet.size - 1,
-        ((struct p_event*)p)->packet.data, received_size);
+    printf("Data %d-%d saved: data='%s'\n",
+        ((struct p_event*)p)->packet.seq_number - (peer_initial_seq_number + 1),
+        ((struct p_event*)p)->packet.seq_number - (peer_initial_seq_number + 1) + ((struct p_event*)p)->packet.size - 1,
+        ((struct p_event*)p)->packet.data);
 }
 
 static void receive_data(void *p)
 {
     printf("Data arrived: size=%d seq_number=%d\n",
         ((struct p_event*)p)->packet.size, ((struct p_event*)p)->packet.seq_number);
-
-    if (((initial_seq_number + 1) + received_size) == ((struct p_event*)p)->packet.seq_number) {
-        save_data((struct p_event *)p);
-        received_size += ((struct p_event*)p)->packet.size;
-    } else {
-        printf("Data ignored\n");
-    }
+    
+    save_data((struct p_event *)p);
 
     // make error in ACK
-    // ((struct p_event *)p)->packet.seq_number-=rand()%2;
+    //((struct p_event *)p)->packet.seq_number-=rand()%2;
 
     send_packet(F_ACK, (struct p_event *)p, 0);
 }
@@ -211,14 +228,25 @@ static void receive_ack(void *p)
     printf("ACK received: ack_number=%d\n",
         ((struct p_event*)p)->packet.ack_number);
 
-    set_timer(0);           // Stop Timer
+    // printf("queue_front:%d, queue_rear:%d\n", send_buffer.front, send_buffer.rear);
+
+    if (((struct p_event*)p)->packet.ack_number - 1 == (last_acknowledgment_received + get_packet_size(queue_front(&send_buffer)))) {
+        printf("ACK: set last_acknowledgment_received=%d\n", (last_acknowledgment_received + get_packet_size(queue_front(&send_buffer))));
+        last_acknowledgment_received = last_acknowledgment_received + get_packet_size(queue_front(&send_buffer));
+        queue_pop(&send_buffer);
+    }
+
+    if (last_acknowledgment_received == last_frame_sent) {
+        printf("Stop resend timer\n");
+        set_timer(0);           // Stop Timer
+        // go to established state
+    }
 }
 
 struct state_action p_FSM[NUM_STATE][NUM_EVENT] = {
   //  for each event:
   //  RCV_SYN,						RCV_FIN,				RCV_ACK,							RCV_DATA,
   //  CONNECT,						CLOSE,					SEND,								TIMEOUT
-
 
   // - LISTEN state
     {{ passive_con,	SYN_RECEIVED },	{ NULL,	LISTEN },		{ NULL,	LISTEN },					{ NULL,	LISTEN },
@@ -233,12 +261,8 @@ struct state_action p_FSM[NUM_STATE][NUM_EVENT] = {
      { NULL, SYN_RECEIVED },		{ close_con, LISTEN },	{ NULL, 			SYN_RECEIVED },	{ close_con, LISTEN		  }},
 
   // - ESTABLISHED state
-    {{ NULL, ESTABLISHED },			{ close_con, LISTEN },	{ NULL,				ESTABLISHED	},	{ receive_data, ESTABLISHED },
-     { NULL, ESTABLISHED },			{ close_con, LISTEN },	{ send_data,		SENDING		},	{ NULL,			ESTABLISHED }},
-
-  // - SENDING state
     {{ NULL, ESTABLISHED },			{ close_con, LISTEN },	{ receive_ack,		ESTABLISHED	},	{ receive_data, ESTABLISHED },
-     { NULL, ESTABLISHED },			{ close_con, LISTEN },	{ send_data,		SENDING		},	{ send_data,	SENDING }},
+     { NULL, ESTABLISHED },			{ close_con, LISTEN },	{ send_data,		ESTABLISHED	},	{ resend_data,	ESTABLISHED }},
 };
 
 struct p_event *get_event(void)
@@ -259,16 +283,8 @@ loop:
                 // if then, decode header to make event
 
                 if (event.packet.flags & F_SYN) {
-                    printf("SYN: set initial_seq_number=%d\n", event.packet.seq_number);
-                    initial_seq_number = event.packet.seq_number;
-                }
-
-                if (event.packet.flags & F_ACK) {
-                    if(event.packet.ack_number != next_seq_number) {
-                        printf("ACK ignored: expected=%d, but received=%d\n", next_seq_number, event.packet.ack_number);
-                        goto loop;
-                    }
-                    current_seq_number = event.packet.ack_number;
+                    printf("SYN: set peer_initial_seq_number=%d\n", event.packet.seq_number);
+                    peer_initial_seq_number = event.packet.seq_number;
                 }
 
                 switch (event.packet.flags) {
@@ -276,7 +292,6 @@ loop:
                         event.event = RCV_SYN;
                         break;
                     case F_ACK:
-                        data_count++;
                     case F_SYN | F_ACK:
                         event.event = RCV_ACK;
                         break;
@@ -303,10 +318,15 @@ loop:
                 event.event = CLOSE;
                 break;
             case '2':
+                if (queue_size(&send_buffer) >= SEND_WINDOW_SIZE) {
+                    printf("Send buffer is full!\n");
+                    goto loop;
+                }
+
                 event.event = SEND;
-                event.packet.seq_number = current_seq_number;
-                sprintf(event.packet.data, "%09d", data_count);   // create data
-                event.size = strlen(event.packet.data) + 1;
+                event.packet.seq_number = last_frame_sent + 1;
+                sprintf(event.packet.data, "%09d", data_count++);   // create data
+                event.size = get_packet_size(event.packet.data);
                 break;
             case '3':
                 return NULL;  // QUIT
@@ -323,13 +343,13 @@ Protocol_Loop(void)
     struct p_event *eventp;
 
     data_count = 0;
-    received_size = 0;
 
     srand(time(NULL));
-    current_seq_number = next_seq_number = rand(); // initial sequence number
-    printf("my initial_seq_number: %d\n", current_seq_number);
+    my_initial_seq_number = rand();
+    printf("my_initial_seq_number: %d\n", my_initial_seq_number);
 
     timer_init();
+    queue_init(&send_buffer, SEND_WINDOW_SIZE + 1);
     while (1) {
         printf("\nCurrent State = %s\n", st_name[c_state]);
 
